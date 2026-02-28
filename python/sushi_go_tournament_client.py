@@ -1,26 +1,19 @@
 #!/usr/bin/env python3
 """
-Sushi Go Client - Tournament-Grade Strategic Bot
+Sushi Go Tournament Client - Strategic Bot
 
-Tournament strategy:
-  - PUDDING FIRST: Puddings are the single biggest end-game swing (+6/-6 = 12 pt
-    gap). We collect puddings aggressively from round 1 and deny them to leaders.
-  - DENIAL PLAY: Before passing the hand, we evaluate each card for the DENIAL
-    value it carries - what does the next player lose if we take it? Opponent
-    with wasabi ready? Deny their Squid Nigiri. Opponent needs 1 more sashimi?
-    Take it even if it wastes ours.
-  - SCORE TRACKING: We parse ROUND_END scores to know who is winning and adjust
-    strategy: deny the leader's preferred cards, lock in points aggressively.
-  - WASABI+NIGIRI: Play together in same turn via chopsticks to guarantee 9 pts.
-    Never let a bird-in-hand nigiri be passed to an opponent with wasabi ready.
-  - CHOPSTICK COMBOS: Wasabi+Squid (9), sashimi completion, tempura completion,
-    or any two cards both worth >=2.5 pts.
+Plays a full tournament using the same strategy as sushi_go_client2.py:
+  - PUDDING FIRST: Aggressive pudding collection with context-aware urgency.
+  - DENIAL PLAY: Takes cards that block opponents' high-value combos.
+  - WASABI+NIGIRI: Pairs them in the same turn via chopsticks for 9 pts.
+  - SCORE TRACKING: Parses ROUND_END scores to track who is winning.
+  - CHOPSTICK COMBOS: Wasabi+Squid, sashimi completion, tempura completion.
 
 Usage:
-    python sushi_go_client2.py <server_host> <server_port> <game_id> <player_name>
+    python sushi_go_tournament_client.py <server_host> <server_port> <tournament_id> <player_name>
 
 Example:
-    python sushi_go_client2.py localhost 7878 abc123 MyBot
+    python sushi_go_tournament_client.py localhost 7878 spicy-salmon MyBot
 """
 
 import json
@@ -33,17 +26,18 @@ from typing import Optional
 
 @dataclass
 class GameState:
-    """Tracks the current state of the game."""
-    game_id: str
-    player_id: int
-    my_name: str
+    """Tracks the current state of a single game within the tournament."""
+    game_id: str = ""
+    player_id: int = 0
+    rejoin_token: str = ""
+    my_name: str = ""
     hand: list = field(default_factory=list)
     round: int = 1
     turn: int = 1
     played_cards: list = field(default_factory=list)           # our played-area this round
     puddings: int = 0                                          # our cumulative puddings
     player_count: int = 0
-    # Cumulative scores parsed from ROUND_END (ours + opponents)
+    # Cumulative scores parsed from ROUND_END
     total_scores: dict = field(default_factory=dict)           # name -> total points so far
     my_total_score: int = 0
     # Per-opponent tracking (keyed by player name)
@@ -54,7 +48,7 @@ class GameState:
     opponent_dumpling: dict = field(default_factory=dict)      # name -> dumpling count this round
     opponent_wasabi: dict = field(default_factory=dict)        # name -> unused wasabi count
 
-    # ── Derived convenience helpers ───────────────────────────────────────────
+    # -- Derived convenience helpers --
     @property
     def has_chopsticks(self) -> bool:
         return "Chopsticks" in self.played_cards
@@ -88,8 +82,8 @@ class GameState:
         return any(v > 0 for v in self.opponent_wasabi.values())
 
 
-class SushiGoClient:
-    """A strategic client for playing Sushi Go."""
+class SushiGoTournamentClient:
+    """A strategic client for playing Sushi Go tournaments."""
 
     def __init__(self, host: str, port: int):
         self.host = host
@@ -97,8 +91,11 @@ class SushiGoClient:
         self.sock: Optional[socket.socket] = None
         self.state: Optional[GameState] = None
         self._recv_buffer = ""
+        # Tournament state
+        self.tournament_id: str = ""
+        self.tournament_rejoin_token: str = ""
 
-    # ── Networking ────────────────────────────────────────────────────────────
+    # -- Networking --
 
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -137,29 +134,53 @@ class SushiGoClient:
             if predicate(message):
                 return message
 
-    # ── Join / Signal ─────────────────────────────────────────────────────────
+    # -- Tournament Join / Match --
 
-    def join_game(self, game_id: str, player_name: str) -> bool:
-        self.send(f"JOIN {game_id} {player_name}")
+    def join_tournament(self, tournament_id: str, player_name: str) -> bool:
+        self.tournament_id = tournament_id
+        self.send(f"TOURNEY {tournament_id} {player_name}")
         response = self.receive_until(
-            lambda l: l.startswith("WELCOME") or l.startswith("ERROR")
+            lambda line: line.startswith("TOURNAMENT_WELCOME") or line.startswith("ERROR")
+        )
+        if response.startswith("TOURNAMENT_WELCOME"):
+            parts = response.split()
+            self.tournament_rejoin_token = parts[3] if len(parts) > 3 else ""
+            print(f"Joined tournament {tournament_id} (rejoin token: {self.tournament_rejoin_token})")
+            return True
+        print(f"Failed to join tournament: {response}")
+        return False
+
+    def join_match(self, match_token: str, player_name: str) -> bool:
+        self.send(f"TJOIN {match_token}")
+        response = self.receive_until(
+            lambda line: line.startswith("WELCOME") or line.startswith("ERROR")
         )
         if response.startswith("WELCOME"):
             parts = response.split()
+            rejoin_token = parts[3] if len(parts) > 3 else ""
             self.state = GameState(
                 game_id=parts[1],
                 player_id=int(parts[2]),
+                rejoin_token=rejoin_token,
                 my_name=player_name,
             )
+            print(f"Joined match (game: {self.state.game_id})")
             return True
-        print(f"Failed to join: {response}")
+        print(f"Failed to join match: {response}")
         return False
 
     def signal_ready(self):
         self.send("READY")
         return self.receive()
 
-    # ── Low-level play commands ───────────────────────────────────────────────
+    def leave_game(self):
+        self.send("LEAVE")
+        self.receive_until(
+            lambda line: line.startswith("OK") or line.startswith("ERROR")
+        )
+        self.state = None
+
+    # -- Low-level play commands --
 
     def play_card(self, card_index: int) -> str:
         self.send(f"PLAY {card_index}")
@@ -169,7 +190,7 @@ class SushiGoClient:
         self.send(f"CHOPSTICKS {index1} {index2}")
         return self.receive()
 
-    # ── Parsing ───────────────────────────────────────────────────────────────
+    # -- Parsing --
 
     def parse_hand(self, message: str):
         """Parse HAND message and refresh hand state."""
@@ -184,11 +205,8 @@ class SushiGoClient:
 
     def _parse_played(self, message: str):
         """
-        Parse PLAYED message to update opponent maki / pudding tracking.
-
+        Parse PLAYED message to update opponent tracking.
         Format: PLAYED Alice:Squid Nigiri; Bob:Tempura, Wasabi; ...
-        A player can have multiple cards listed (comma-separated) when
-        chopsticks were used.
         """
         if not self.state:
             return
@@ -200,7 +218,7 @@ class SushiGoClient:
             colon_idx = segment.index(":")
             player_name = segment[:colon_idx].strip()
             if player_name == self.state.my_name:
-                continue  # we track ourselves separately
+                continue
             cards_str = segment[colon_idx + 1:].strip()
             cards = [c.strip() for c in cards_str.split(",")]
             for card in cards:
@@ -233,20 +251,17 @@ class SushiGoClient:
                         self.state.opponent_wasabi.get(player_name, 0) + 1
                     )
                 if "Nigiri" in card:
-                    # Nigiri consumes an unused wasabi
                     cur = self.state.opponent_wasabi.get(player_name, 0)
                     if cur > 0:
                         self.state.opponent_wasabi[player_name] = cur - 1
 
-    # ── Denial Value ──────────────────────────────────────────────────────────
+    # -- Denial Value --
 
     def _denial_value(self, card: str) -> float:
         """
         Estimate the points DENIED to the next player if we take this card.
-        This is added on top of our own gain so that cards which block opponents'
-        high-value combos get extra weight.
-
-        We use Conservative estimates so denial never overrides our own big plays.
+        Added on top of our own gain so cards that block opponents' combos get
+        extra weight.
         """
         s = self.state
         if s is None or s.player_count < 2:
@@ -254,9 +269,7 @@ class SushiGoClient:
 
         denial = 0.0
 
-        # ── Deny a Nigiri to someone with unused wasabi ───────────────────────
-        # If any opponent has an unused wasabi, a Squid Nigiri is worth 9 to them.
-        # Taking it away denies ~6 extra pts (9 - 3 base = 6 bonus).
+        # Deny a Nigiri to someone with unused wasabi
         if card == "Squid Nigiri" and s.any_opponent_has_wasabi():
             denial += 6.0
         if card == "Salmon Nigiri" and s.any_opponent_has_wasabi():
@@ -264,21 +277,21 @@ class SushiGoClient:
         if card == "Egg Nigiri" and s.any_opponent_has_wasabi():
             denial += 2.0
 
-        # ── Deny the third sashimi (10 pts) ──────────────────────────────────
+        # Deny the third sashimi (10 pts)
         if card == "Sashimi":
             max_opp = max(s.opponent_sashimi.values(), default=0)
             if max_opp % 3 == 2:
-                denial += 8.0   # Denying a full 10-pt set completion
+                denial += 8.0
             elif max_opp % 3 == 1:
-                denial += 2.0   # Slowing a sashimi run
+                denial += 2.0
 
-        # ── Deny tempura pair completion ──────────────────────────────────────
+        # Deny tempura pair completion
         if card == "Tempura":
             max_opp = max(s.opponent_tempura.values(), default=0)
             if max_opp % 2 == 1:
-                denial += 4.0   # Denying a 5-pt pair completion
+                denial += 4.0
 
-        # ── Deny maki leader adding more symbols ─────────────────────────────
+        # Deny maki leader adding more symbols
         if card.startswith("Maki Roll"):
             try:
                 symbols = int(card[-2])
@@ -287,31 +300,25 @@ class SushiGoClient:
             my_maki = s.my_maki()
             max_opp = s.max_opponent_maki()
             if max_opp > my_maki + symbols * 2:
-                # We can't win maki; but we can deny pts to the leader.
                 denial += symbols * 0.8
 
-        # ── Deny pudding to the pudding leader ───────────────────────────────
+        # Deny pudding to the pudding leader
         if card == "Pudding":
             max_opp_p = s.max_opponent_puddings()
             my_p = s.puddings
             if max_opp_p > my_p:
-                denial += 1.5   # Taking this away from the leader is valuable
+                denial += 1.5
 
-        # ── Deny wasabi setup to any opponent ────────────────────────────────
+        # Deny wasabi setup to any opponent
         if card == "Wasabi" and not s.has_unused_wasabi:
-            # If we take wasabi, opponents can't triple a nigiri with it
             denial += 1.0
 
         return denial
 
-    # ── Card Valuation ────────────────────────────────────────────────────────
+    # -- Card Valuation --
 
     def _card_value(self, card: str, turns_left: int) -> float:
-        """
-        Return an estimated point value for playing *card* right now.
-
-        turns_left: turns remaining AFTER this one (= hand_size - 1).
-        """
+        """Return an estimated point value for playing *card* right now."""
         s = self.state
         if s is None:
             return 0.0
@@ -325,14 +332,7 @@ class SushiGoClient:
         maki_mine = s.my_maki()
         has_unused_wasabi = s.has_unused_wasabi
 
-        # ── Nigiri ────────────────────────────────────────────────────────────
-        # Tripled when we already have an unused wasabi on the table.
-        # Raw base values are set ABOVE wasabi (3.5) to ensure we always take
-        # a bird-in-hand nigiri rather than playing wasabi speculatively when
-        # both are in the same hand without chopsticks (the nigiri would be
-        # passed to the opponent once we play wasabi).
-        # DENIAL: if any opponent has an unused wasabi and we take the high
-        # nigiri, we deny them the triple — denial value is added directly.
+        # -- Nigiri --
         if card == "Squid Nigiri":
             base = 9.0 if has_unused_wasabi else 4.0
             return base + self._denial_value(card)
@@ -343,52 +343,45 @@ class SushiGoClient:
             base = 3.0 if has_unused_wasabi else 1.0
             return base + self._denial_value(card)
 
-        # ── Wasabi ────────────────────────────────────────────────────────────
-        # Value depends on whether we expect a high nigiri soon.
-        # If we already have an unused wasabi, don't stack another.
+        # -- Wasabi --
         if card == "Wasabi":
             if has_unused_wasabi:
-                return 0.1   # Stacking wasabi is wasteful
-            # Realistic expected nigiri bonus, accounting for the fact that the
-            # nigiri currently in OUR hand will be PASSED AWAY next turn.
-            # P(landing any nigiri in remaining turns) * average bonus ~2-3 pts.
+                return 0.1
             if turns_left >= 5:
-                return 3.5   # Enough hands to reliably land a Squid/Salmon
+                return 3.5
             if turns_left >= 3:
-                return 3.0   # Still good odds
+                return 3.0
             if turns_left == 2:
-                return 2.0   # Risky; nigiri might not come
+                return 2.0
             if turns_left == 1:
-                return 1.0   # Last real chance
-            return 0.0       # Last turn; wasabi would never be used
+                return 1.0
+            return 0.0
 
-        # ── Tempura: 5 pts per pair ───────────────────────────────────────────
+        # -- Tempura: 5 pts per pair --
         if card == "Tempura":
             if tempura_count % 2 == 1:
-                return 5.0 + self._denial_value(card)   # Completes our pair
+                return 5.0 + self._denial_value(card)
             return (2.5 if turns_left >= 1 else 0.0) + self._denial_value(card)
 
-        # ── Sashimi: 10 pts per set of 3 ─────────────────────────────────────
+        # -- Sashimi: 10 pts per set of 3 --
         if card == "Sashimi":
             mod = sashimi_count % 3
             denial = self._denial_value(card)
             if mod == 2:
-                return 10.0 + denial   # Completes a set RIGHT NOW
+                return 10.0 + denial
             if mod == 1:
                 return (5.0 if turns_left >= 1 else 0.0) + denial
             return (3.0 if turns_left >= 2 else 0.0) + denial
 
-        # ── Dumpling: cumulative scoring 1/3/6/10/15 pts ─────────────────────
-        # Snowball: once we have 3+, dumplings compound quickly.
+        # -- Dumpling: cumulative scoring 1/3/6/10/15 pts --
         if card == "Dumpling":
             marginals = [1, 2, 3, 4, 5, 0]
             base = float(marginals[min(dumpling_count, 5)])
-            # Extra bonus for turns left: dumplings get better the more we collect
             if dumpling_count >= 2 and turns_left >= 2:
-                base += 0.5   # Snowball incentive — we likely see more dumplings
+                base += 0.5
             return base
 
-        # ── Maki Rolls: competitive ───────────────────────────────────────────
+        # -- Maki Rolls: competitive --
         if card.startswith("Maki Roll"):
             try:
                 symbols = int(card[-2])
@@ -398,64 +391,47 @@ class SushiGoClient:
             gap = max_opp - maki_mine
             denial = self._denial_value(card)
             if turns_left == 0 and maki_mine + symbols <= max_opp:
-                return 0.1 + denial  # Can't win; small denial value only
+                return 0.1 + denial
             if gap <= symbols * (turns_left + 1):
-                # Realistic shot at 1st place (6 pts)
                 return symbols * 1.3 + 0.5 + denial
-            # "Probably 2nd" — 0 pts in 2-player, 3 pts in 3+.
             if s.player_count == 2:
                 return 0.2 + denial
             return symbols * 0.5 + denial
 
-        # ── Pudding ───────────────────────────────────────────────────────────
-        # +6 for most at game end, -6 for fewest (skipped in 2-player).
-        # We track urgency dynamically from observed opponent pudding counts.
-        # KEY RULE: When we have NO opponent data yet (first HAND of the game),
-        # use a moderate investment value — not a crisis value — since everyone
-        # starts at zero and there is nothing to panic about.
+        # -- Pudding --
         if card == "Pudding":
             max_opp_p = s.max_opponent_puddings()
             min_opp_p = s.min_opponent_puddings()
             my_p = s.puddings
-            rounds_left_after = 3 - current_round  # rounds still to come after this
+            rounds_left_after = 3 - current_round
             denial = self._denial_value(card)
-            has_opp_data = bool(s.opponent_puddings)  # False only at very start
+            has_opp_data = bool(s.opponent_puddings)
 
             if s.player_count == 2:
-                # 2-player: only +6 for most puddings, no -6 penalty
                 if not has_opp_data:
-                    return 2.5 + rounds_left_after * 0.4 + denial  # Baseline investment
+                    return 2.5 + rounds_left_after * 0.4 + denial
                 if my_p < max_opp_p:
-                    return 3.5 + rounds_left_after * 0.5 + denial  # Must catch up
+                    return 3.5 + rounds_left_after * 0.5 + denial
                 if my_p == max_opp_p:
-                    return 3.0 + rounds_left_after * 0.4 + denial  # Hold the tie
-                return 2.0 + rounds_left_after * 0.3 + denial      # We lead; hold it
+                    return 3.0 + rounds_left_after * 0.4 + denial
+                return 2.0 + rounds_left_after * 0.3 + denial
 
-            # Multiplayer pudding strategy.
-            # Use moderate baseline until we have observed opponent pudding plays.
             if not has_opp_data:
-                return 2.0 + rounds_left_after * 0.4 + denial  # Fair investment; no panic
+                return 2.0 + rounds_left_after * 0.4 + denial
             if my_p < min_opp_p:
-                # We are CONFIRMED LAST — real danger of -6 penalty
                 return 4.5 + rounds_left_after * 0.5 + denial
             if my_p == min_opp_p:
-                # Tied for last with at least one opponent who has same count
                 return 3.0 + rounds_left_after * 0.4 + denial
             if my_p < max_opp_p:
-                # Mid-pack: moderate incentive to stay competitive
                 return 2.0 + rounds_left_after * 0.3 + denial
             if my_p == max_opp_p:
-                # Sharing the lead: invest to break the tie
                 return 1.8 + rounds_left_after * 0.25 + denial
-            # We lead outright: maintain without overprioritising
             return 1.5 + rounds_left_after * 0.2 + denial
 
-        # ── Chopsticks ────────────────────────────────────────────────────────
-        # Worth having early; minimal value late in round.
-        # Cap at 2.5 so a guaranteed Squid Nigiri (3.5) always beats it.
+        # -- Chopsticks --
         if card == "Chopsticks":
             if s.has_chopsticks:
-                return 0.1   # Already have one in play; stacking is useless
+                return 0.1
             if turns_left >= 4:
                 return 2.5
             if turns_left >= 3:
@@ -468,18 +444,12 @@ class SushiGoClient:
 
         return 0.0
 
-    # ── Chopstick Decision ────────────────────────────────────────────────────
+    # -- Chopstick Decision --
 
     def _best_chopstick_play(self, hand: list) -> tuple:
         """
         Decide whether to use chopsticks and which pair to play.
-
         Returns (should_use: bool, idx1: int, idx2: int).
-
-        Priorities (highest first):
-          1. Wasabi + high nigiri in the SAME turn (guarantees the triple).
-          2. Complete the final sashimi of a set + another high-value card.
-          3. Any two distinct cards both valued >= threshold.
         """
         turns_left = len(hand) - 1
 
@@ -490,10 +460,7 @@ class SushiGoClient:
         if n < 2:
             return False, 0, 1
 
-        # ── Priority 1: Wasabi + high nigiri together ──────────────────────
-        # Playing BOTH in one turn guarantees the triple multiplier.
-        # Only Squid/Salmon are worth combining; Egg Nigiri (3 pts) is not
-        # worth burning both wasabi and chopsticks for — save for a better nigiri.
+        # Priority 1: Wasabi + high nigiri together (guarantees triple)
         if not self.state.has_unused_wasabi:
             wasabi_indices = [i for i, c in enumerate(hand) if c == "Wasabi"]
             if wasabi_indices:
@@ -504,15 +471,11 @@ class SushiGoClient:
                     if nigiri_indices:
                         return True, wi, nigiri_indices[0]
 
-        # ── Priority 1b: Unused wasabi already played + nigiri in hand ────────
-        # If wasabi is already on the table and a high nigiri is in hand, the
-        # best play is just the nigiri (handled by choose_card). But if we
-        # ALSO have another high-value card, use chopsticks to grab both.
+        # Priority 1b: Unused wasabi already played + nigiri + good companion
         if self.state.has_unused_wasabi:
             nigiri_indices = {c: i for i, c in enumerate(hand)
                               if c in ("Squid Nigiri", "Salmon Nigiri", "Egg Nigiri")}
             if nigiri_indices:
-                # Pick the best nigiri
                 for best_nig in ("Squid Nigiri", "Salmon Nigiri", "Egg Nigiri"):
                     if best_nig in nigiri_indices:
                         ni = nigiri_indices[best_nig]
@@ -520,12 +483,11 @@ class SushiGoClient:
                             ((val(j), j) for j in range(n) if j != ni),
                             default=(0.0, 0),
                         )
-                        # Only use chopsticks if the companion card is worthwhile
                         if best_other[0] >= 2.5:
                             return True, ni, best_other[1]
                         break
 
-        # ── Priority 2: Complete a sashimi set + grab another good card ────
+        # Priority 2: Complete a sashimi set + grab another good card
         played = self.state.played_cards if self.state else []
         sashimi_count = played.count("Sashimi")
         if sashimi_count % 3 == 2:
@@ -539,7 +501,7 @@ class SushiGoClient:
                 if best_other[0] >= 1.5:
                     return True, si, best_other[1]
 
-        # ── Priority 2b: Complete a tempura pair + grab another good card ───
+        # Priority 2b: Complete a tempura pair + grab another good card
         tempura_count = played.count("Tempura")
         if tempura_count % 2 == 1:
             tempura_indices = [i for i, c in enumerate(hand) if c == "Tempura"]
@@ -552,26 +514,24 @@ class SushiGoClient:
                 if best_other[0] >= 2.0:
                     return True, ti, best_other[1]
 
-        # ── Priority 3: Two cards both worth a meaningful amount ────────────
+        # Priority 3: Two cards both worth a meaningful amount
         scored = sorted(((val(i), i) for i in range(n)), reverse=True)
         v1, i1 = scored[0]
         v2, i2 = scored[1]
 
-        # Threshold rises late in the round because returning chopsticks to
-        # opponents is more costly when there are fewer turns left.
         if turns_left >= 3:
             threshold = 2.5
         elif turns_left == 2:
             threshold = 3.0
         else:
-            threshold = 4.0   # Very late: only worthwhile for premium combos
+            threshold = 4.0
 
         if v2 >= threshold:
             return True, i1, i2
 
         return False, 0, 1
 
-    # ── Turn Logic ────────────────────────────────────────────────────────────
+    # -- Turn Logic --
 
     def choose_card(self, hand: list) -> int:
         """Return the index of the single best card to play."""
@@ -595,7 +555,6 @@ class SushiGoClient:
                 response = self.play_chopsticks(idx1, idx2)
                 if response.startswith("OK"):
                     card1, card2 = hand[idx1], hand[idx2]
-                    # Chopsticks card returns to passing hand; remove from played
                     if "Chopsticks" in self.state.played_cards:
                         self.state.played_cards.remove("Chopsticks")
                     self.state.played_cards.append(card1)
@@ -615,10 +574,10 @@ class SushiGoClient:
             if played_card == "Pudding":
                 self.state.puddings += 1
 
-    # ── Message Handling ──────────────────────────────────────────────────────
+    # -- Message Handling --
 
-    def handle_message(self, message: str) -> bool:
-        """Process one server message; return False when the game is over."""
+    def handle_game_message(self, message: str) -> bool:
+        """Handle an in-game message. Returns False on GAME_END."""
         if message.startswith("HAND"):
             self.parse_hand(message)
 
@@ -646,13 +605,11 @@ class SushiGoClient:
 
         elif message.startswith("ROUND_END"):
             if self.state:
-                # Parse round scores to track who is winning overall.
                 parts = message.split(None, 2)
                 if len(parts) >= 3:
                     try:
                         scores = json.loads(parts[2])
-                        # ROUND_END scores are CUMULATIVE (running total), not
-                        # per-round deltas — SET, do not ADD.
+                        # ROUND_END scores are cumulative totals -- SET, do not ADD.
                         for name, score in scores.items():
                             if name == self.state.my_name:
                                 self.state.my_total_score = score
@@ -660,7 +617,6 @@ class SushiGoClient:
                                 self.state.total_scores[name] = score
                     except (json.JSONDecodeError, ValueError, KeyError):
                         pass
-                # NOTE: puddings already incremented in real-time in play_turn.
                 self.state.played_cards = []
                 self.state.opponent_maki = {}
                 self.state.opponent_sashimi = {}
@@ -677,23 +633,77 @@ class SushiGoClient:
 
         return True
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
+    # -- Game Loop --
 
-    def run(self, game_id: str, player_name: str):
+    def play_game(self) -> Optional[str]:
+        """Play a full game. Returns a pending tournament message if one arrived mid-game."""
+        while True:
+            message = self.receive()
+
+            # Tournament messages can arrive during a game
+            if message.startswith("TOURNAMENT_MATCH") or message.startswith("TOURNAMENT_COMPLETE"):
+                return message
+
+            game_running = self.handle_game_message(message)
+
+            if message.startswith("HAND") and self.state and self.state.hand:
+                self.play_turn()
+
+            if not game_running:
+                return None
+
+    # -- Tournament Loop --
+
+    def run(self, tournament_id: str, player_name: str):
+        """Main tournament loop."""
         try:
             self.connect()
-            if not self.join_game(game_id, player_name):
-                return
-            self.signal_ready()
 
-            running = True
-            while running:
-                message = self.receive()
-                if not message:
+            if not self.join_tournament(tournament_id, player_name):
+                return
+
+            pending_message = None
+
+            while True:
+                if pending_message:
+                    msg = pending_message
+                    pending_message = None
+                else:
+                    msg = self.receive()
+
+                if not msg:
                     continue
-                running = self.handle_message(message)
-                if message.startswith("HAND") and self.state and self.state.hand:
-                    self.play_turn()
+
+                if msg.startswith("TOURNAMENT_MATCH"):
+                    # TOURNAMENT_MATCH <tid> <match_token> <round> [<opponent>]
+                    parts = msg.split()
+                    match_token = parts[2]
+                    round_num = parts[3]
+                    opponent = parts[4] if len(parts) > 4 else "unknown"
+
+                    if match_token == "BYE" or opponent == "BYE":
+                        print(f"Round {round_num}: got a BYE, auto-advancing...")
+                        continue
+
+                    print(f"Round {round_num}: matched vs {opponent}")
+
+                    if not self.join_match(match_token, player_name):
+                        continue
+
+                    self.signal_ready()
+
+                    pending_message = self.play_game()
+
+                    self.leave_game()
+
+                elif msg.startswith("TOURNAMENT_COMPLETE"):
+                    parts = msg.split()
+                    winner = parts[2] if len(parts) > 2 else "unknown"
+                    print(f"Tournament complete! Winner: {winner}")
+                    break
+
+                elif msg.startswith("TOURNAMENT_JOINED"):
+                    print(f"  {msg}")
 
         except KeyboardInterrupt:
             print("\nDisconnecting...")
@@ -706,17 +716,17 @@ class SushiGoClient:
 
 def main():
     if len(sys.argv) != 5:
-        print("Usage: python sushi_go_client2.py <host> <port> <game_id> <player_name>")
-        print("Example: python sushi_go_client2.py localhost 7878 abc123 MyBot")
+        print("Usage: python sushi_go_tournament_client.py <host> <port> <tournament_id> <player_name>")
+        print("Example: python sushi_go_tournament_client.py localhost 7878 spicy-salmon MyBot")
         sys.exit(1)
 
     host = sys.argv[1]
     port = int(sys.argv[2])
-    game_id = sys.argv[3]
+    tournament_id = sys.argv[3]
     player_name = sys.argv[4]
 
-    client = SushiGoClient(host, port)
-    client.run(game_id, player_name)
+    client = SushiGoTournamentClient(host, port)
+    client.run(tournament_id, player_name)
 
 
 if __name__ == "__main__":
