@@ -160,44 +160,91 @@ class SushiGoClient:
         """
         Choose which card to play.
 
-        This is where you implement your AI strategy!
-        The default implementation uses a simple priority-based approach.
+        Strategy: score each card based on guaranteed and expected value,
+        accounting for combos already built, turns remaining, and wasabi state.
 
         Args:
-            hand: List of card codes in your current hand
+            hand: List of card names in your current hand
 
         Returns:
             Index of the card to play (0-based)
         """
-        # Simple priority-based strategy
-        priority = [
-            "Squid Nigiri",  # 3 points, or 9 with wasabi
-            "Salmon Nigiri",  # 2 points, or 6 with wasabi
-            "Maki Roll (3)",  # 3 maki rolls
-            "Maki Roll (2)",  # 2 maki rolls
-            "Tempura",  # 5 points per pair
-            "Sashimi",  # 10 points per set of 3
-            "Dumpling",  # Increasing value
-            "Wasabi",  # Triples next nigiri
-            "Egg Nigiri",  # 1 point, or 3 with wasabi
-            "Pudding",  # End game scoring
-            "Maki Roll (1)",  # 1 maki roll
-            "Chopsticks",  # Play 2 cards next turn
-        ]
+        if len(hand) == 1:
+            return 0
 
-        # If we have wasabi, prioritize nigiri
-        if self.state and self.state.has_unused_wasabi:
-            for nigiri in ["Squid Nigiri", "Salmon Nigiri", "Egg Nigiri"]:
-                if nigiri in hand:
-                    return hand.index(nigiri)
+        played = self.state.played_cards if self.state else []
+        turns_left = len(hand) - 1  # turns remaining after this one
+        current_round = self.state.round if self.state else 1
 
-        # Otherwise use priority list
-        for card in priority:
-            if card in hand:
-                return hand.index(card)
+        # Tally combos we've built this round
+        tempura_count = played.count("Tempura")
+        sashimi_count = played.count("Sashimi")
+        dumpling_count = played.count("Dumpling")
+        maki_total = sum(int(c[-2]) for c in played if c.startswith("Maki Roll"))
+        wasabi_count = played.count("Wasabi")
+        nigiri_count = sum(1 for c in played if "Nigiri" in c)
+        # Correct unused-wasabi check: each nigiri uses up one wasabi
+        has_unused_wasabi = wasabi_count > nigiri_count
 
-        # Fallback: random
-        return random.randint(0, len(hand) - 1)
+        def card_value(card: str) -> float:
+            # --- Nigiri: guaranteed points, tripled by wasabi ---
+            if card == "Squid Nigiri":
+                return 9.0 if has_unused_wasabi else 3.0
+            if card == "Salmon Nigiri":
+                return 6.0 if has_unused_wasabi else 2.0
+            if card == "Egg Nigiri":
+                return 3.0 if has_unused_wasabi else 1.0
+
+            # --- Wasabi: multiplier for NEXT nigiri (from a future rotated hand) ---
+            if card == "Wasabi":
+                if has_unused_wasabi:
+                    return 0.1  # Already have one unused; stacking is wasteful
+                if turns_left >= 1:
+                    return 2.5  # Expected bonus from tripling a future nigiri
+                return 0.0
+
+            # --- Tempura: 5 pts per pair ---
+            if card == "Tempura":
+                if tempura_count % 2 == 1:   # Completes a pair right now
+                    return 5.0
+                return 2.5 if turns_left >= 1 else 0.0  # Need 1 more turn to finish
+
+            # --- Sashimi: 10 pts per set of 3 ---
+            if card == "Sashimi":
+                mod = sashimi_count % 3
+                if mod == 2:                 # Completes a set right now
+                    return 10.0
+                if mod == 1:                 # Have 1 spare; need 1 more after this
+                    return 3.5 if turns_left >= 1 else 0.0
+                # mod == 0: starting fresh, need 2 more after this
+                return 3.5 if turns_left >= 2 else 0.0
+
+            # --- Dumpling: marginal value 1/2/3/4/5/0 for 1st–6th ---
+            if card == "Dumpling":
+                marginals = [1, 2, 3, 4, 5, 0]
+                return float(marginals[min(dumpling_count, 5)])
+
+            # --- Maki Rolls: competitive (~1 pt per symbol + commitment bonus) ---
+            if card.startswith("Maki Roll"):
+                symbols = int(card[-2])
+                if maki_total == 0 and turns_left == 0:
+                    return 0.3  # Too late to start competing
+                # Reward investment: already-committed maki is more valuable
+                return symbols * 1.0 + (0.5 if maki_total > 0 else 0.0)
+
+            # --- Pudding: end-of-game +6 / -6 swing ---
+            if card == "Pudding":
+                # More valuable in later rounds (closer to final tally)
+                return 1.0 + (current_round - 1) * 0.5
+
+            # --- Chopsticks: lets us play 2 cards in a future turn ---
+            if card == "Chopsticks":
+                return 1.0 if turns_left >= 2 else 0.0
+
+            return 0.0
+
+        scores = [(card_value(c), i) for i, c in enumerate(hand)]
+        return max(scores)[1]
 
     def handle_message(self, message: str):
         """Handle a message from the server."""
